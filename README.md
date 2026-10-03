@@ -1,145 +1,102 @@
-# WebFetch MCP — Cloud Run
+# webfetch-mcp
 
-Two Cloud Run services that give LiteLLM (or any MCP client) live web search and page fetching.
+An MCP server over HTTP that gives an LLM client two tools: web search (through a SearxNG instance) and readable page fetching (through Mozilla Readability).
+
+## How it works
 
 ```
-LiteLLM Proxy
-    └── MCP (StreamableHTTP) ──► webfetch-mcp   (Cloud Run, public)
-                                      └── HTTP ──► searxng  (Cloud Run, internal)
-                                                       └── Google, Bing, DDG, arXiv...
+MCP client (any StreamableHTTP client)
+    |
+    |  POST/GET/DELETE /mcp
+    v
+webfetch-mcp  (this repo, Node.js)
+    |-- web_search --> SearxNG  /search?format=json  --> search engines
+    '-- web_fetch  --> target URL --> JSDOM + Readability --> plain text
 ```
 
----
+`server-http.mjs` runs a plain Node HTTP server and exposes the MCP SDK's StreamableHTTP transport, so it can run as a long-lived container (it was written with Cloud Run in mind). The search backend is a separate service; a matching SearxNG setup lives in the companion repo `searxng-mcp`.
 
-## Services
+This is an HTTP adaptation of the stdio `webfetch-mcp` server by Jay Leon (MIT, github.com/manull/webfetch-mcp). The original MIT notice is kept in `LICENSE`.
 
-| Service | Image | Public? | Purpose |
-|---------|-------|---------|---------|
-| `webfetch-mcp` | Node.js 20 + JSDOM + Readability | ✅ Yes | MCP server |
-| `searxng` | Official SearxNG | 🔒 Internal only | Metasearch engine |
+### Tools
 
-**MCP Tools exposed:**
-| Tool | Description |
-|------|-------------|
-| `web_search` | Search via SearxNG (Google, Bing, DDG, arXiv, GitHub, etc.) |
-| `web_fetch` | Fetch + extract readable text from any URL via Mozilla Readability |
+| Tool | Inputs | What it returns |
+|------|--------|-----------------|
+| `web_search` | `query` (required), `limit` (1-20, default 5), `site`, `engines`, `language`, `safesearch` (0-2), `page`, `time_range` (day/week/month/year) | Numbered list of title, URL, snippet and engine |
+| `web_fetch` | `url` (required, http/https), `max_chars` (default 20000) | Page title, byline if any, and the extracted text |
 
----
+### Behaviour worth knowing
 
-## Prerequisites
+- `web_fetch` only extracts `text/html` and `application/xhtml` responses. It strips scripts, nav, headers, footers and common ad/sidebar blocks, runs Readability, and falls back to the largest `main`/`article`/content block when Readability finds too little text.
+- Fetches send browser-like headers with a rotating User-Agent, wait at least 1 second between requests to the same host, and retry once on HTTP 429/502/503/504.
+- Timeouts: 15 s for search, 20 s for fetch.
+- A simple in-process rate limit applies to all tool calls: 12 calls per 5 minutes, at most 8 in any 30 second burst.
+- MCP sessions are kept in memory, so run a single instance (or use session affinity).
 
-- Google Cloud SDK installed and authenticated (`gcloud auth login`)
-- A GCP project with billing enabled
-- `openssl` available locally (for secret generation)
+### Endpoints
 
----
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/mcp` | MCP messages (creates a session on first call) |
+| GET | `/mcp` | SSE stream |
+| DELETE | `/mcp` | Close a session (`mcp-session-id` header) |
+| GET | `/health` | Liveness check, returns `{"status":"ok", ...}` |
 
-## Deploy
+## Stack
+
+Node.js 20, `@modelcontextprotocol/sdk`, `jsdom`, `@mozilla/readability`. Docker image based on `node:20-slim` with `dumb-init`.
+
+## Run locally
+
+You need a SearxNG instance with JSON output enabled (see `searxng-mcp`). Both default to port 8080, so put one of them on another port.
 
 ```bash
-chmod +x deploy.sh
-./deploy.sh YOUR_GCP_PROJECT_ID [REGION]
-
-# Example
-./deploy.sh my-gcp-project us-central1
+npm ci
+SEARXNG_BASE=http://localhost:8888 PORT=8080 node server-http.mjs
 ```
 
-The script:
-1. Enables required GCP APIs
-2. Generates a SearxNG secret key and stores it in Secret Manager
-3. Builds and deploys SearxNG (internal-only)
-4. Grants webfetch-mcp's service account invoker access to SearxNG
-5. Builds and deploys webfetch-mcp with `SEARXNG_BASE` pointed at SearxNG
-6. Prints the MCP endpoint URL
+`npm start` runs the same thing (`node server-http.mjs`).
 
----
-
-## LiteLLM Integration
-
-Add to your `litellm_config.yaml`:
-
-```yaml
-mcp_servers:
-  - name: webfetch
-    url: https://YOUR-MCP-SERVICE.run.app/mcp
-```
-
-Or with the Python SDK:
-
-```python
-import litellm
-
-response = litellm.completion(
-    model="gpt-4o",
-    messages=[{"role": "user", "content": "Search for the latest AI news"}],
-    mcp_servers=[{
-        "name": "webfetch",
-        "url": "https://YOUR-MCP-SERVICE.run.app/mcp"
-    }]
-)
-```
-
----
-
-## Cloud Run Settings
-
-### webfetch-mcp
-| Setting | Value | Reason |
-|---------|-------|--------|
-| Memory | 512Mi | JSDOM parses full HTML pages in-process |
-| CPU | 1 | Node.js is single-threaded; extra CPUs don't help much |
-| Concurrency | 10 | Each request does async I/O — safe to interleave |
-| Min instances | 1 | Keep warm — MCP clients have short connection timeouts |
-| Auth | Public | LiteLLM connects without GCP credentials |
-
-### searxng
-| Setting | Value | Reason |
-|---------|-------|--------|
-| Memory | 512Mi | Python app with multiple engine workers |
-| Concurrency | 80 | SearxNG is designed for high concurrency |
-| Min instances | 1 | Keep warm — cold start would cascade into MCP timeouts |
-| Auth | Internal only | Only webfetch-mcp can call it |
-
----
-
-## Cost Estimate
-
-Both services at min-instances=1 in us-central1:
-
-| | CPU | Memory | ~Monthly idle |
-|-|-----|--------|--------------|
-| webfetch-mcp | 1 vCPU | 512Mi | ~$8 |
-| searxng | 1 vCPU | 512Mi | ~$8 |
-| **Total** | | | **~$16/month** |
-
-Set `--min-instances=0` on both to go scale-to-zero (~$0 idle, but expect 5–8s cold starts).
-
----
-
-## Testing
+## Run with Docker
 
 ```bash
-# Health check
-curl https://YOUR-MCP-URL.run.app/health
-
-# The MCP endpoint speaks StreamableHTTP — test with any MCP client
-# or via LiteLLM as shown above
+docker build -t webfetch-mcp .
+docker run --rm -p 8080:8080 -e SEARXNG_BASE=http://<searxng-host>:8080 webfetch-mcp
 ```
 
----
+## Deploy to Cloud Run (example)
 
-## File Structure
+```bash
+gcloud run deploy webfetch-mcp \
+  --source . \
+  --region <region> \
+  --set-env-vars SEARXNG_BASE=<searxng-url> \
+  --max-instances 1
+```
 
+The server does not authenticate MCP clients itself and sends no auth headers to SearxNG. Put access control in front of it (Cloud Run IAM, a gateway, or a private network) if it is reachable from the internet.
+
+## Quick test
+
+```bash
+curl http://localhost:8080/health
+
+curl -X POST http://localhost:8080/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 ```
-.
-├── deploy.sh                     ← run this
-├── webfetch-mcp-cloudrun/
-│   ├── server-http.mjs           ← HTTP MCP server (StreamableHTTP transport)
-│   ├── Dockerfile
-│   └── package.json
-└── searxng-cloudrun/
-    ├── Dockerfile
-    ├── entrypoint.sh             ← injects SECRET_KEY at runtime
-    └── searxng/
-        └── settings.yml          ← JSON output enabled, limiter off
-```
+
+Any MCP client that speaks StreamableHTTP can then point at `http://<host>:8080/mcp`.
+
+## Configuration
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PORT` | `8080` | HTTP listen port |
+| `SEARXNG_BASE` | `http://localhost:8080` | Base URL of the SearxNG instance |
+| `DEBUG` | unset | Set to `true` for debug logging |
+
+## Author
+
+Built by Saim Safdar - https://saim.me
